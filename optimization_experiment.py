@@ -3,26 +3,32 @@ subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet",
                        "transformers==4.44.2", "nvidia-ml-py", "pandas"])
 
 import time, csv, os, warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
 import pynvml
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 warnings.filterwarnings("ignore")
 
 RESULTS_DIR = "/workspace/results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+MODELS = [
+    {"name": "gpt2",         "model_id": "gpt2"},
+    {"name": "gpt-neo-125m", "model_id": "EleutherAI/gpt-neo-125m"},
+]
+
 BATCH_SIZES    = [1, 2, 4, 8, 16, 32]
-INPUT_LENGTHS  = [32, 128, 512]   # 대표 seq만 (전체 sweep은 baseline에서 완료)
+INPUT_LENGTHS  = [32, 128, 512]
 MAX_NEW_TOKENS = 50
 WARMUP_RUNS    = 10
 MEASURE_RUNS   = 20
 
 CONFIGS = [
-    {"name": "baseline",        "fp16": False, "compile": False},
-    {"name": "fp16",            "fp16": True,  "compile": False},
-    {"name": "compile",         "fp16": False, "compile": True},
-    {"name": "fp16+compile",    "fp16": True,  "compile": True},
+    {"name": "baseline",     "fp16": False, "compile": False},
+    {"name": "fp16",         "fp16": True,  "compile": False},
+    {"name": "compile",      "fp16": False, "compile": True},
+    {"name": "fp16+compile", "fp16": True,  "compile": True},
 ]
 
 pynvml.nvmlInit()
@@ -32,10 +38,7 @@ gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 def get_gpu_stats():
     mem  = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
     util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
-    return {
-        "gpu_util_pct":    util.gpu,
-        "gpu_mem_used_mb": mem.used // (1024 ** 2),
-    }
+    return {"gpu_util_pct": util.gpu, "gpu_mem_used_mb": mem.used // (1024 ** 2)}
 
 
 def make_input(tokenizer, batch_size, input_length, device):
@@ -47,8 +50,7 @@ def make_input(tokenizer, batch_size, input_length, device):
     return input_ids, attention_mask
 
 
-def run_experiment(model, tokenizer, batch_size, input_length, device, model_config):
-    max_pos = 1024  # GPT-2 hard limit
+def run_experiment(model, tokenizer, batch_size, input_length, device, max_pos, model_cfg, opt_cfg):
     if input_length + MAX_NEW_TOKENS > max_pos:
         return None
 
@@ -83,9 +85,10 @@ def run_experiment(model, tokenizer, batch_size, input_length, device, model_con
     throughput  = (MAX_NEW_TOKENS * batch_size) / avg_latency
 
     return {
-        "config":           model_config["name"],
-        "fp16":             model_config["fp16"],
-        "compiled":         model_config["compile"],
+        "model_name":       model_cfg["name"],
+        "config":           opt_cfg["name"],
+        "fp16":             opt_cfg["fp16"],
+        "compiled":         opt_cfg["compile"],
         "batch_size":       batch_size,
         "input_length":     input_length,
         "avg_latency_s":    round(avg_latency, 4),
@@ -95,12 +98,12 @@ def run_experiment(model, tokenizer, batch_size, input_length, device, model_con
     }
 
 
-def load_model(config, device):
-    model = GPT2LMHeadModel.from_pretrained("gpt2")
-    if config["fp16"]:
+def load_model(model_cfg, opt_cfg, device):
+    model = AutoModelForCausalLM.from_pretrained(model_cfg["model_id"])
+    if opt_cfg["fp16"]:
         model = model.half()
     model = model.to(device).eval()
-    if config["compile"]:
+    if opt_cfg["compile"]:
         model = torch.compile(model, dynamic=True)
     return model
 
@@ -109,11 +112,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device} | GPU: {torch.cuda.get_device_name(0)}\n")
 
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-
     out_path   = os.path.join(RESULTS_DIR, "optimization_results.csv")
     fieldnames = [
-        "config", "fp16", "compiled", "batch_size", "input_length",
+        "model_name", "config", "fp16", "compiled",
+        "batch_size", "input_length",
         "avg_latency_s", "p50_latency_s", "throughput_tok_s",
         "gpu_util_pct", "gpu_mem_used_mb",
     ]
@@ -122,29 +124,38 @@ def main():
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        for cfg in CONFIGS:
-            print(f"=== Config: {cfg['name']} ===")
-            model = load_model(cfg, device)
+        for model_cfg in MODELS:
+            print(f"\n{'='*55}")
+            print(f"Model: {model_cfg['name']} ({model_cfg['model_id']})")
+            tokenizer = AutoTokenizer.from_pretrained(model_cfg["model_id"])
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
 
-            for bs in BATCH_SIZES:
-                for seq_len in INPUT_LENGTHS:
-                    print(f"  batch={bs:2d}  seq={seq_len:4d} ...", end=" ", flush=True)
-                    row = run_experiment(model, tokenizer, bs, seq_len, device, cfg)
-                    if row is None:
-                        print("skipped")
-                        continue
-                    writer.writerow(row)
-                    f.flush()
-                    print(f"latency={row['avg_latency_s']:.3f}s  "
-                          f"throughput={row['throughput_tok_s']:.1f} tok/s  "
-                          f"GPU={row['gpu_util_pct']}%  "
-                          f"mem={row['gpu_mem_used_mb']}MB")
+            for opt_cfg in CONFIGS:
+                print(f"\n  --- Config: {opt_cfg['name']} ---")
+                model   = load_model(model_cfg, opt_cfg, device)
+                max_pos = model.config.max_position_embeddings
 
-            del model
-            torch.cuda.empty_cache()
-            print()
+                for bs in BATCH_SIZES:
+                    for seq_len in INPUT_LENGTHS:
+                        print(f"    batch={bs:2d}  seq={seq_len:4d} ...", end=" ", flush=True)
+                        row = run_experiment(
+                            model, tokenizer, bs, seq_len, device,
+                            max_pos, model_cfg, opt_cfg
+                        )
+                        if row is None:
+                            print("skipped")
+                            continue
+                        writer.writerow(row)
+                        f.flush()
+                        print(f"latency={row['avg_latency_s']:.3f}s  "
+                              f"thr={row['throughput_tok_s']:.1f} tok/s  "
+                              f"GPU={row['gpu_util_pct']}%")
 
-    print(f"Results saved → {out_path}")
+                del model
+                torch.cuda.empty_cache()
+
+    print(f"\nResults saved → {out_path}")
     pynvml.nvmlShutdown()
 
 

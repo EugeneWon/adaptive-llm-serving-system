@@ -3,16 +3,20 @@ subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet",
                        "transformers==4.44.2", "nvidia-ml-py", "pandas"])
 
 import time, csv, os, warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
 import pynvml
-import pandas as pd
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 warnings.filterwarnings("ignore")
 
-RESULTS_DIR    = "/workspace/results"
-OPT_CSV        = os.path.join(RESULTS_DIR, "optimization_results.csv")
+RESULTS_DIR = "/workspace/results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
+
+MODELS = [
+    {"name": "gpt2",         "model_id": "gpt2"},
+    {"name": "gpt-neo-125m", "model_id": "EleutherAI/gpt-neo-125m"},
+]
 
 BATCH_SIZES    = [1, 2, 4, 8, 16, 32]
 INPUT_LENGTHS  = [32, 128, 512]
@@ -25,9 +29,9 @@ gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
 
 # ── Regime Classifier ─────────────────────────────────────────────────────────
-# Thresholds derived from profiling data:
-#   low-util    : batch ≤ 4          → GPU util < 40% across all seq
-#   memory-bound: batch ≥ 8, seq ≥ 256 → scaling_eff < 0.75
+# Thresholds derived from profiling data across both models:
+#   low-util    : batch ≤ 4          → GPU util < 40%
+#   memory-bound: batch ≥ 8, seq ≥ 256
 #   kernel-overhead: everything else
 
 def classify_regime(batch_size, seq_length):
@@ -40,18 +44,13 @@ def classify_regime(batch_size, seq_length):
 
 
 # ── Policy: regime → config ────────────────────────────────────────────────────
-# memory-bound     → FP16  (reduces memory traffic, 1.08x measured gain)
-# kernel-overhead  → compile (fuses kernels; limited gain for autoregressive gen)
-# low-utilization  → baseline (in production: queue & batch; here: measure as-is)
-
 POLICY = {
-    "memory-bound":         {"fp16": True,  "compile": False},
-    "kernel-overhead-bound":{"fp16": False, "compile": True},
-    "low-utilization":      {"fp16": False, "compile": False},
+    "memory-bound":          {"fp16": True,  "compile": False},
+    "kernel-overhead-bound": {"fp16": False, "compile": True},
+    "low-utilization":       {"fp16": False, "compile": False},
 }
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def get_gpu_stats():
     mem  = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
     util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
@@ -67,8 +66,8 @@ def make_input(tokenizer, batch_size, input_length, device):
     return input_ids, attention_mask
 
 
-def run_inference(model, tokenizer, batch_size, input_length, device):
-    if input_length + MAX_NEW_TOKENS > 1024:
+def run_inference(model, tokenizer, batch_size, input_length, device, max_pos):
+    if input_length + MAX_NEW_TOKENS > max_pos:
         return None
 
     input_ids, attention_mask = make_input(tokenizer, batch_size, input_length, device)
@@ -108,8 +107,8 @@ def run_inference(model, tokenizer, batch_size, input_length, device):
     }
 
 
-def load_model(cfg, device):
-    model = GPT2LMHeadModel.from_pretrained("gpt2")
+def load_model(model_cfg, cfg, device):
+    model = AutoModelForCausalLM.from_pretrained(model_cfg["model_id"])
     if cfg["fp16"]:
         model = model.half()
     model = model.to(device).eval()
@@ -118,85 +117,85 @@ def load_model(cfg, device):
     return model
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def cfg_name(cfg):
+    n = ("fp16" if cfg["fp16"] else "") + ("+compile" if cfg["compile"] else "")
+    return n or "baseline"
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device} | GPU: {torch.cuda.get_device_name(0)}\n")
 
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-
     out_path   = os.path.join(RESULTS_DIR, "adaptive_results.csv")
     fieldnames = [
-        "batch_size", "input_length",
+        "model_name", "batch_size", "input_length",
         "regime", "selected_config",
         "avg_latency_s", "p50_latency_s", "throughput_tok_s",
         "gpu_util_pct", "gpu_mem_used_mb",
     ]
 
-    # 실행할 (batch, seq) 조합별로 regime + config 미리 결정
-    plan = []
-    for bs in BATCH_SIZES:
-        for seq in INPUT_LENGTHS:
-            regime = classify_regime(bs, seq)
-            cfg    = POLICY[regime]
-            plan.append((bs, seq, regime, cfg))
-
-    # config 종류별로 묶어서 모델 로딩 최소화
-    from itertools import groupby
+    # build plan: (bs, seq, regime, cfg) per model
+    plan = [
+        (bs, seq, classify_regime(bs, seq), POLICY[classify_regime(bs, seq)])
+        for bs in BATCH_SIZES
+        for seq in INPUT_LENGTHS
+    ]
+    # sort by cfg to minimise model reloads
     plan_sorted = sorted(plan, key=lambda x: (x[3]["fp16"], x[3]["compile"]))
-
-    print("=== Adaptive Policy Plan ===")
-    for bs, seq, regime, cfg in plan:
-        config_name = ("fp16" if cfg["fp16"] else "") + \
-                      ("+compile" if cfg["compile"] else "") or "baseline"
-        print(f"  batch={bs:2d}  seq={seq:4d} → [{regime:22s}] → {config_name}")
-
-    print("\n=== Running Experiments ===")
-
-    results = []
-    current_cfg_key = None
-    model = None
-
-    for bs, seq, regime, cfg in plan_sorted:
-        cfg_key = (cfg["fp16"], cfg["compile"])
-        if cfg_key != current_cfg_key:
-            if model is not None:
-                del model
-                torch.cuda.empty_cache()
-            config_name = ("fp16" if cfg["fp16"] else "") + \
-                          ("+compile" if cfg["compile"] else "") or "baseline"
-            print(f"\n--- Loading model: {config_name} ---")
-            model = load_model(cfg, device)
-            current_cfg_key = cfg_key
-
-        config_name = ("fp16" if cfg["fp16"] else "") + \
-                      ("+compile" if cfg["compile"] else "") or "baseline"
-        print(f"  batch={bs:2d}  seq={seq:4d}  [{regime:22s}] ...", end=" ", flush=True)
-
-        row = run_inference(model, tokenizer, bs, seq, device)
-        if row is None:
-            print("skipped")
-            continue
-
-        results.append({
-            "batch_size":       bs,
-            "input_length":     seq,
-            "regime":           regime,
-            "selected_config":  config_name,
-            **row,
-        })
-        print(f"latency={row['avg_latency_s']:.3f}s  "
-              f"throughput={row['throughput_tok_s']:.1f} tok/s  "
-              f"GPU={row['gpu_util_pct']}%")
-
-    if model is not None:
-        del model
-        torch.cuda.empty_cache()
 
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(results)
+
+        for model_cfg in MODELS:
+            print(f"\n{'='*55}")
+            print(f"Model: {model_cfg['name']} ({model_cfg['model_id']})")
+            tokenizer = AutoTokenizer.from_pretrained(model_cfg["model_id"])
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            print("\n=== Adaptive Policy Plan ===")
+            for bs, seq, regime, cfg in plan:
+                print(f"  batch={bs:2d}  seq={seq:4d} → [{regime:22s}] → {cfg_name(cfg)}")
+
+            print("\n=== Running Experiments ===")
+            current_cfg_key = None
+            model           = None
+            max_pos         = None
+
+            for bs, seq, regime, cfg in plan_sorted:
+                cfg_key = (cfg["fp16"], cfg["compile"])
+                if cfg_key != current_cfg_key:
+                    if model is not None:
+                        del model
+                        torch.cuda.empty_cache()
+                    print(f"\n  --- Loading model: {cfg_name(cfg)} ---")
+                    model           = load_model(model_cfg, cfg, device)
+                    max_pos         = model.config.max_position_embeddings
+                    current_cfg_key = cfg_key
+
+                print(f"  batch={bs:2d}  seq={seq:4d}  [{regime:22s}] ...", end=" ", flush=True)
+                row = run_inference(model, tokenizer, bs, seq, device, max_pos)
+                if row is None:
+                    print("skipped")
+                    continue
+
+                writer.writerow({
+                    "model_name":      model_cfg["name"],
+                    "batch_size":      bs,
+                    "input_length":    seq,
+                    "regime":          regime,
+                    "selected_config": cfg_name(cfg),
+                    **row,
+                })
+                f.flush()
+                print(f"latency={row['avg_latency_s']:.3f}s  "
+                      f"thr={row['throughput_tok_s']:.1f} tok/s  "
+                      f"GPU={row['gpu_util_pct']}%")
+
+            if model is not None:
+                del model
+                torch.cuda.empty_cache()
 
     print(f"\nResults saved → {out_path}")
     pynvml.nvmlShutdown()
