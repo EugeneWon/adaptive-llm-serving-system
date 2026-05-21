@@ -20,9 +20,10 @@ MODELS = [
 
 BATCH_SIZES    = [1, 2, 4, 8, 16, 32]
 INPUT_LENGTHS  = [32, 128, 512]
-MAX_NEW_TOKENS = 50
-WARMUP_RUNS    = 10
-MEASURE_RUNS   = 20
+MAX_NEW_TOKENS  = 50
+WARMUP_RUNS     = 10
+COMPILE_WARMUP  = 30
+MEASURE_RUNS    = 20
 
 pynvml.nvmlInit()
 gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
@@ -30,9 +31,9 @@ gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
 # ── Regime Classifier ─────────────────────────────────────────────────────────
 # Thresholds derived from profiling data across both models:
-#   low-util    : batch ≤ 4          → GPU util < 40%
-#   memory-bound: batch ≥ 8, seq ≥ 256
-#   kernel-overhead: everything else
+#   low-util    : batch ≤ 4          → GPU util < 40%, insufficient parallelism
+#   memory-bound: batch ≥ 8, seq ≥ 256 → bandwidth-limited, high util
+#   kernel-overhead-bound: everything else → moderate util, many small kernel launches
 
 def classify_regime(batch_size, seq_length):
     if batch_size <= 4:
@@ -44,6 +45,10 @@ def classify_regime(batch_size, seq_length):
 
 
 # ── Policy: regime → config ────────────────────────────────────────────────────
+# kernel-overhead-bound: operator fusion via torch.compile (reduce-overhead mode)
+#   reduces redundant kernel launches and improves data locality.
+# memory-bound: fp16 cuts memory footprint and bandwidth pressure.
+# low-utilization: baseline (runtime cannot force batch size changes).
 POLICY = {
     "memory-bound":          {"fp16": True,  "compile": False},
     "kernel-overhead-bound": {"fp16": False, "compile": True},
@@ -66,7 +71,7 @@ def make_input(tokenizer, batch_size, input_length, device):
     return input_ids, attention_mask
 
 
-def run_inference(model, tokenizer, batch_size, input_length, device, max_pos):
+def run_inference(model, tokenizer, batch_size, input_length, device, max_pos, compiled=False):
     if input_length + MAX_NEW_TOKENS > max_pos:
         return None
 
@@ -78,8 +83,9 @@ def run_inference(model, tokenizer, batch_size, input_length, device, max_pos):
         pad_token_id=tokenizer.eos_token_id,
     )
 
+    n_warmup = COMPILE_WARMUP if compiled else WARMUP_RUNS
     try:
-        for _ in range(WARMUP_RUNS):
+        for _ in range(n_warmup):
             with torch.no_grad():
                 model.generate(input_ids, **gen_kwargs)
         torch.cuda.synchronize()
@@ -101,7 +107,7 @@ def run_inference(model, tokenizer, batch_size, input_length, device, max_pos):
     throughput = (MAX_NEW_TOKENS * batch_size) / avg_lat
     return {
         "avg_latency_s":    round(avg_lat, 4),
-        "p50_latency_s":    round(sorted(latencies)[len(latencies) // 2], 4),
+        "p50_latency_s":    round(sorted(latencies)[(len(latencies) - 1) // 2], 4),
         "throughput_tok_s": round(throughput, 2),
         **get_gpu_stats(),
     }
@@ -113,13 +119,13 @@ def load_model(model_cfg, cfg, device):
         model = model.half()
     model = model.to(device).eval()
     if cfg["compile"]:
-        model = torch.compile(model, dynamic=True)
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
     return model
 
 
 def cfg_name(cfg):
-    n = ("fp16" if cfg["fp16"] else "") + ("+compile" if cfg["compile"] else "")
-    return n or "baseline"
+    parts = (["fp16"] if cfg["fp16"] else []) + (["compile"] if cfg["compile"] else [])
+    return "+".join(parts) or "baseline"
 
 
 def main():
@@ -175,7 +181,7 @@ def main():
                     current_cfg_key = cfg_key
 
                 print(f"  batch={bs:2d}  seq={seq:4d}  [{regime:22s}] ...", end=" ", flush=True)
-                row = run_inference(model, tokenizer, bs, seq, device, max_pos)
+                row = run_inference(model, tokenizer, bs, seq, device, max_pos, compiled=cfg["compile"])
                 if row is None:
                     print("skipped")
                     continue

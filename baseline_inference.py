@@ -90,8 +90,8 @@ def run_experiment(model, tokenizer, batch_size, input_length, device):
         "input_length":     input_length,
         "max_new_tokens":   MAX_NEW_TOKENS,
         "avg_latency_s":    round(avg_latency, 4),
-        "p50_latency_s":    round(sorted(latencies)[len(latencies) // 2], 4),
-        "p95_latency_s":    round(sorted(latencies)[int(len(latencies) * 0.95)], 4),
+        "p50_latency_s":    round(sorted(latencies)[(len(latencies) - 1) // 2], 4),
+        "p95_latency_s":    round(sorted(latencies)[int(len(latencies) * 0.95) - 1], 4),
         "throughput_tok_s": round(throughput, 2),
         **get_gpu_stats(),
     }

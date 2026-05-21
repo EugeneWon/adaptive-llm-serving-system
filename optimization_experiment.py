@@ -20,9 +20,10 @@ MODELS = [
 
 BATCH_SIZES    = [1, 2, 4, 8, 16, 32]
 INPUT_LENGTHS  = [32, 128, 512]
-MAX_NEW_TOKENS = 50
-WARMUP_RUNS    = 10
-MEASURE_RUNS   = 20
+MAX_NEW_TOKENS  = 50
+WARMUP_RUNS     = 10
+COMPILE_WARMUP  = 30  # compiled graphs need extra runs to JIT-stabilize all decode shapes
+MEASURE_RUNS    = 20
 
 CONFIGS = [
     {"name": "baseline",     "fp16": False, "compile": False},
@@ -62,8 +63,9 @@ def run_experiment(model, tokenizer, batch_size, input_length, device, max_pos, 
         pad_token_id=tokenizer.eos_token_id,
     )
 
+    n_warmup = COMPILE_WARMUP if opt_cfg["compile"] else WARMUP_RUNS
     try:
-        for _ in range(WARMUP_RUNS):
+        for _ in range(n_warmup):
             with torch.no_grad():
                 model.generate(input_ids, **gen_kwargs)
         torch.cuda.synchronize()
@@ -92,7 +94,7 @@ def run_experiment(model, tokenizer, batch_size, input_length, device, max_pos, 
         "batch_size":       batch_size,
         "input_length":     input_length,
         "avg_latency_s":    round(avg_latency, 4),
-        "p50_latency_s":    round(sorted(latencies)[len(latencies) // 2], 4),
+        "p50_latency_s":    round(sorted(latencies)[(len(latencies) - 1) // 2], 4),
         "throughput_tok_s": round(throughput, 2),
         **get_gpu_stats(),
     }
@@ -104,7 +106,10 @@ def load_model(model_cfg, opt_cfg, device):
         model = model.half()
     model = model.to(device).eval()
     if opt_cfg["compile"]:
-        model = torch.compile(model, dynamic=True)
+        # reduce-overhead mode uses CUDA graphs / kernel fusion to minimize launch overhead,
+        # targeting the kernel-overhead-bound regime. dynamic=True is intentionally omitted
+        # so the compiler can perform static operator fusion per decode step shape.
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
     return model
 
 

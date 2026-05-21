@@ -22,9 +22,9 @@ BATCH_SIZES   = sorted(df["batch_size"].unique())
 COLORS        = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
 
 REGIME_COLORS = {
-    "low-utilization": "#aec6e8",
-    "compute-scaling": "#98df8a",
-    "memory-bound":    "#ffbb78",
+    "low-utilization":       "#aec6e8",
+    "kernel-overhead-bound": "#98df8a",
+    "memory-bound":          "#ffbb78",
 }
 
 MODEL_DISPLAY = {
@@ -45,7 +45,7 @@ def add_regime(sub_df):
         elif row["scaling_eff"] < 0.75:
             return "memory-bound"
         else:
-            return "compute-scaling"
+            return "kernel-overhead-bound"
     sub_df["regime"] = sub_df.apply(classify, axis=1)
     return sub_df
 
