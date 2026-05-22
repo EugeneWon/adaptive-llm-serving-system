@@ -36,13 +36,18 @@ MODEL_DISPLAY = {
 def add_regime(sub_df):
     ref = sub_df[sub_df["batch_size"] == 1].set_index("input_length")["throughput_tok_s"]
     sub_df = sub_df.copy()
+    # scaling_eff is kept for Figure 4 visualization only
     sub_df["scaling_eff"] = sub_df.apply(
         lambda r: r["throughput_tok_s"] / (ref[r["input_length"]] * r["batch_size"]), axis=1
     )
+    # Rule-based classifier: matches adaptive_policy.py thresholds exactly
+    #   low-utilization    : batch ≤ 4          (insufficient parallelism)
+    #   memory-bound       : batch ≥ 8, seq ≥ 256 (bandwidth-limited)
+    #   kernel-overhead-bound: everything else   (frequent small kernel launches)
     def classify(row):
-        if row["gpu_util_pct"] < 40:
+        if row["batch_size"] <= 4:
             return "low-utilization"
-        elif row["scaling_eff"] < 0.75:
+        elif row["batch_size"] >= 8 and row["input_length"] >= 256:
             return "memory-bound"
         else:
             return "kernel-overhead-bound"
@@ -55,7 +60,7 @@ df = pd.concat([add_regime(g) for _, g in df.groupby("model_name")], ignore_inde
 
 print("\n=== Regime Classification ===")
 print(df[["model_name", "batch_size", "input_length",
-          "gpu_util_pct", "scaling_eff", "regime"]].to_string(index=False))
+          "gpu_util_pct", "regime"]].to_string(index=False))
 
 
 # ── Figure 1: Throughput vs Batch Size (side-by-side per model) ───────────────
@@ -160,7 +165,7 @@ for ax, model_name in zip(axes, MODELS):
         ax.plot(s["batch_size"], s["scaling_eff"] * 100,
                 marker="o", label=f"seq={seq_len}", color=COLORS[i])
     ax.axhline(100, color="k",      linestyle="--", linewidth=1, alpha=0.4, label="ideal")
-    ax.axhline(75,  color="orange", linestyle=":",  linewidth=1, alpha=0.7, label="memory-bound (75%)")
+    ax.axhline(75,  color="orange", linestyle=":",  linewidth=1, alpha=0.7, label="scaling degradation threshold (75%)")
     ax.set_title(MODEL_DISPLAY.get(model_name, model_name))
     ax.set_xlabel("Batch Size")
     ax.set_ylabel("Scaling Efficiency (%)")

@@ -2,7 +2,7 @@ import subprocess, sys
 subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet",
                        "transformers==4.44.2", "nvidia-ml-py", "pandas"])
 
-import time, csv, os, warnings
+import time, csv, os, warnings, statistics
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
 import pynvml
@@ -59,7 +59,11 @@ POLICY = {
 def get_gpu_stats():
     mem  = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
     util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
-    return {"gpu_util_pct": util.gpu, "gpu_mem_used_mb": mem.used // (1024 ** 2)}
+    return {
+        "gpu_util_pct":     util.gpu,
+        "gpu_mem_used_mb":  mem.used  // (1024 ** 2),
+        "gpu_mem_total_mb": mem.total // (1024 ** 2),
+    }
 
 
 def make_input(tokenizer, batch_size, input_length, device):
@@ -105,9 +109,13 @@ def run_inference(model, tokenizer, batch_size, input_length, device, max_pos, c
 
     avg_lat    = sum(latencies) / len(latencies)
     throughput = (MAX_NEW_TOKENS * batch_size) / avg_lat
+    sorted_lat = sorted(latencies)
     return {
         "avg_latency_s":    round(avg_lat, 4),
-        "p50_latency_s":    round(sorted(latencies)[(len(latencies) - 1) // 2], 4),
+        "p50_latency_s":    round(sorted_lat[(len(sorted_lat) - 1) // 2], 4),
+        "p95_latency_s":    round(sorted_lat[int(len(sorted_lat) * 0.95) - 1], 4),
+        "std_latency_s":    round(statistics.stdev(latencies), 5),
+        "ms_per_token":     round(avg_lat * 1000 / MAX_NEW_TOKENS, 3),
         "throughput_tok_s": round(throughput, 2),
         **get_gpu_stats(),
     }
@@ -119,6 +127,9 @@ def load_model(model_cfg, cfg, device):
         model = model.half()
     model = model.to(device).eval()
     if cfg["compile"]:
+        # reduce-overhead mode uses CUDA graphs / kernel fusion to minimize launch overhead,
+        # targeting the kernel-overhead-bound regime. dynamic=True is intentionally omitted
+        # so the compiler can perform static operator fusion per decode step shape.
         model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
     return model
 
@@ -134,13 +145,13 @@ def main():
 
     out_path   = os.path.join(RESULTS_DIR, "adaptive_results.csv")
     fieldnames = [
-        "model_name", "batch_size", "input_length",
+        "model_name", "batch_size", "input_length", "max_new_tokens",
         "regime", "selected_config",
-        "avg_latency_s", "p50_latency_s", "throughput_tok_s",
-        "gpu_util_pct", "gpu_mem_used_mb",
+        "avg_latency_s", "p50_latency_s", "p95_latency_s", "std_latency_s", "ms_per_token", "throughput_tok_s",
+        "baseline_latency_s", "baseline_throughput_tok_s", "speedup",
+        "gpu_util_pct", "gpu_mem_used_mb", "gpu_mem_total_mb",
     ]
 
-    # build plan: (bs, seq, regime, cfg) per model
     plan = [
         (bs, seq, classify_regime(bs, seq), POLICY[classify_regime(bs, seq)])
         for bs in BATCH_SIZES
@@ -160,6 +171,24 @@ def main():
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
 
+            # ── Phase 0: In-experiment baseline reference ─────────────────────
+            # Measure baseline for all (batch, seq) combinations in the same GPU
+            # session so that speedup comparison is free of inter-experiment noise.
+            print("\n  --- Phase 0: baseline reference pass ---")
+            baseline_ref = {}
+            ref_model = load_model(model_cfg, {"fp16": False, "compile": False}, device)
+            ref_max_pos = ref_model.config.max_position_embeddings
+            for bs in BATCH_SIZES:
+                for seq in INPUT_LENGTHS:
+                    r = run_inference(ref_model, tokenizer, bs, seq, device, ref_max_pos, compiled=False)
+                    if r is not None:
+                        baseline_ref[(bs, seq)] = r
+                        print(f"    baseline batch={bs:2d} seq={seq:4d}  "
+                              f"lat={r['avg_latency_s']:.3f}s  thr={r['throughput_tok_s']:.1f}")
+            del ref_model
+            torch.cuda.empty_cache()
+
+            # ── Phase 1: Adaptive policy pass ────────────────────────────────
             print("\n=== Adaptive Policy Plan ===")
             for bs, seq, regime, cfg in plan:
                 print(f"  batch={bs:2d}  seq={seq:4d} → [{regime:22s}] → {cfg_name(cfg)}")
@@ -186,18 +215,26 @@ def main():
                     print("skipped")
                     continue
 
+                ref     = baseline_ref.get((bs, seq))
+                speedup = round(row["throughput_tok_s"] / ref["throughput_tok_s"], 4) if ref else None
+
                 writer.writerow({
-                    "model_name":      model_cfg["name"],
-                    "batch_size":      bs,
-                    "input_length":    seq,
-                    "regime":          regime,
-                    "selected_config": cfg_name(cfg),
+                    "model_name":               model_cfg["name"],
+                    "batch_size":               bs,
+                    "input_length":             seq,
+                    "max_new_tokens":           MAX_NEW_TOKENS,
+                    "regime":                   regime,
+                    "selected_config":          cfg_name(cfg),
                     **row,
+                    "baseline_latency_s":       ref["avg_latency_s"]    if ref else "",
+                    "baseline_throughput_tok_s":ref["throughput_tok_s"] if ref else "",
+                    "speedup":                  speedup if speedup else "",
                 })
                 f.flush()
+                speedup_str = f"  speedup={speedup:.3f}x" if speedup else ""
                 print(f"latency={row['avg_latency_s']:.3f}s  "
                       f"thr={row['throughput_tok_s']:.1f} tok/s  "
-                      f"GPU={row['gpu_util_pct']}%")
+                      f"GPU={row['gpu_util_pct']}%{speedup_str}")
 
             if model is not None:
                 del model

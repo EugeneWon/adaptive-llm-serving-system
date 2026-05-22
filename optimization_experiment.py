@@ -2,7 +2,7 @@ import subprocess, sys
 subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet",
                        "transformers==4.44.2", "nvidia-ml-py", "pandas"])
 
-import time, csv, os, warnings
+import time, csv, os, warnings, statistics
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
 import pynvml
@@ -39,7 +39,11 @@ gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 def get_gpu_stats():
     mem  = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
     util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
-    return {"gpu_util_pct": util.gpu, "gpu_mem_used_mb": mem.used // (1024 ** 2)}
+    return {
+        "gpu_util_pct":     util.gpu,
+        "gpu_mem_used_mb":  mem.used  // (1024 ** 2),
+        "gpu_mem_total_mb": mem.total // (1024 ** 2),
+    }
 
 
 def make_input(tokenizer, batch_size, input_length, device):
@@ -86,6 +90,7 @@ def run_experiment(model, tokenizer, batch_size, input_length, device, max_pos, 
     avg_latency = sum(latencies) / len(latencies)
     throughput  = (MAX_NEW_TOKENS * batch_size) / avg_latency
 
+    sorted_lat = sorted(latencies)
     return {
         "model_name":       model_cfg["name"],
         "config":           opt_cfg["name"],
@@ -93,8 +98,12 @@ def run_experiment(model, tokenizer, batch_size, input_length, device, max_pos, 
         "compiled":         opt_cfg["compile"],
         "batch_size":       batch_size,
         "input_length":     input_length,
+        "max_new_tokens":   MAX_NEW_TOKENS,
         "avg_latency_s":    round(avg_latency, 4),
-        "p50_latency_s":    round(sorted(latencies)[(len(latencies) - 1) // 2], 4),
+        "p50_latency_s":    round(sorted_lat[(len(sorted_lat) - 1) // 2], 4),
+        "p95_latency_s":    round(sorted_lat[int(len(sorted_lat) * 0.95) - 1], 4),
+        "std_latency_s":    round(statistics.stdev(latencies), 5),
+        "ms_per_token":     round(avg_latency * 1000 / MAX_NEW_TOKENS, 3),
         "throughput_tok_s": round(throughput, 2),
         **get_gpu_stats(),
     }
@@ -120,9 +129,9 @@ def main():
     out_path   = os.path.join(RESULTS_DIR, "optimization_results.csv")
     fieldnames = [
         "model_name", "config", "fp16", "compiled",
-        "batch_size", "input_length",
-        "avg_latency_s", "p50_latency_s", "throughput_tok_s",
-        "gpu_util_pct", "gpu_mem_used_mb",
+        "batch_size", "input_length", "max_new_tokens",
+        "avg_latency_s", "p50_latency_s", "p95_latency_s", "std_latency_s", "ms_per_token", "throughput_tok_s",
+        "gpu_util_pct", "gpu_mem_used_mb", "gpu_mem_total_mb",
     ]
 
     with open(out_path, "w", newline="") as f:

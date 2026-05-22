@@ -18,9 +18,13 @@ _ensure_packages()
 import time
 import csv
 import os
+import warnings
+import statistics
 import torch
 import pynvml
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+warnings.filterwarnings("ignore")
 
 RESULTS_DIR = "/workspace/results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -92,6 +96,8 @@ def run_experiment(model, tokenizer, batch_size, input_length, device):
         "avg_latency_s":    round(avg_latency, 4),
         "p50_latency_s":    round(sorted(latencies)[(len(latencies) - 1) // 2], 4),
         "p95_latency_s":    round(sorted(latencies)[int(len(latencies) * 0.95) - 1], 4),
+        "std_latency_s":    round(statistics.stdev(latencies), 5),
+        "ms_per_token":     round(avg_latency * 1000 / MAX_NEW_TOKENS, 3),
         "throughput_tok_s": round(throughput, 2),
         **get_gpu_stats(),
     }
@@ -107,7 +113,7 @@ def main():
     fieldnames = [
         "model_name",
         "batch_size", "input_length", "max_new_tokens",
-        "avg_latency_s", "p50_latency_s", "p95_latency_s",
+        "avg_latency_s", "p50_latency_s", "p95_latency_s", "std_latency_s", "ms_per_token",
         "throughput_tok_s",
         "gpu_util_pct", "gpu_mem_used_mb", "gpu_mem_total_mb",
     ]

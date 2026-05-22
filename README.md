@@ -1,5 +1,4 @@
-# Profiling-Guided Adaptive Optimization for Memory-Bound LLM Inference  
-### Data Movement Analysis and Workload-Aware Inference Optimization
+# Profiling-Guided Adaptive Optimization for Memory-Bound LLM Inference via Data Movement Analysis
 
 > Graduate-level AI systems project focused on analyzing and optimizing **memory-bound LLM inference** through runtime profiling and workload-aware adaptive optimization.
 >
@@ -59,7 +58,7 @@ The system classifies inference behavior into three regimes based on batch size 
 | Regime | Condition | Description |
 |---|---|---|
 | Low-utilization | batch ≤ 4 | Insufficient parallelism, low GPU utilization |
-| Kernel-overhead-bound | batch ≥ 5, seq < 256 | Many small kernel launches, moderate utilization |
+| Kernel-overhead-bound | batch ≥ 5, not memory-bound | Many small kernel launches, moderate utilization |
 | Memory-bound | batch ≥ 8 and seq ≥ 256 | Bandwidth-limited, high data movement cost |
 
 ---
@@ -72,7 +71,7 @@ Based on the classified regime, the system selects an optimization strategy:
 |---|---|---|
 | Kernel-overhead-bound | `torch.compile` (reduce-overhead mode) | Kernel fusion reduces redundant launches |
 | Memory-bound | FP16 mixed precision | Cuts memory footprint and bandwidth pressure |
-| Low-utilization | Baseline (no opt) | Runtime cannot force batch size changes |
+| Low-utilization | Baseline (no opt) | Increasing batch size is the ideal remedy, but it cannot be enforced at inference runtime when the caller fixes the request size |
 
 Four optimization configurations are benchmarked:
 
@@ -243,16 +242,16 @@ Potential future research directions include:
 # Author
 
 **Eugene Won**  
-M.S. Student, AI / Electronic Engineering  
 Information Coding and Processing Lab  
-Ewha Womans University
+Department of Electronic & Electrical Engineering, AI Software Engineering  
+Ewha Womans University  
+Seoul, Republic of Korea  
+eugenewon12@ewhain.net
 
 ---
 
 # References
 
-- FlashAttention (NeurIPS 2022)
-- PagedAttention / vLLM (SOSP 2023)
-- TorchInductor / TorchDynamo
-- Memory-centric AI systems research
-- LLM inference optimization literature
+[1] PyTorch Team, "TorchDynamo and TorchInductor," 2023.  
+[2] T. Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness," NeurIPS, 2022.  
+[3] W. Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention," SOSP, 2023.

@@ -102,10 +102,15 @@ for row_i, model_name in enumerate(MODELS):
         for cfg, color in STATIC_CONFIGS.items():
             speedups, xs = [], []
             for _, row in sub_adt.iterrows():
-                s = get_static(model_name, cfg, row["batch_size"], seq)
-                if s is not None and s > 0:
-                    speedups.append(row["throughput_tok_s"] / s)
+                if cfg == "baseline" and pd.notna(row["speedup"]) and row["speedup"] > 0:
+                    # Use in-experiment speedup to eliminate cross-experiment GPU noise
+                    speedups.append(float(row["speedup"]))
                     xs.append(row["batch_size"])
+                else:
+                    s = get_static(model_name, cfg, row["batch_size"], seq)
+                    if s is not None and s > 0:
+                        speedups.append(row["throughput_tok_s"] / s)
+                        xs.append(row["batch_size"])
             ax.plot(xs, speedups, marker="o", color=color,
                     label=f"vs {cfg}", linewidth=1.5)
         ax.axhline(1.0, color="gray", linestyle=":", linewidth=1.2, alpha=0.7)
@@ -177,17 +182,22 @@ for model_name in MODELS:
     for k, v in summary.items():
         print(f"    {k:12s}: {v:.1f} tok/s")
 
-    print(f"  Speedup by regime:")
+    # Use in-experiment speedup column if available, else fall back to cross-experiment ratio
+    print(f"  Speedup by regime (in-experiment baseline):")
     for regime in ["low-utilization", "kernel-overhead-bound", "memory-bound"]:
         sub = madt[madt["regime"] == regime]
         if sub.empty:
             continue
-        gains = []
-        for _, row in sub.iterrows():
-            b = get_static(model_name, "baseline", row["batch_size"], row["input_length"])
-            if b:
-                gains.append(row["throughput_tok_s"] / b)
+        if "speedup" in sub.columns and sub["speedup"].notna().any():
+            gains = sub["speedup"].dropna().tolist()
+        else:
+            gains = []
+            for _, row in sub.iterrows():
+                b = get_static(model_name, "baseline", row["batch_size"], row["input_length"])
+                if b:
+                    gains.append(row["throughput_tok_s"] / b)
         if gains:
-            print(f"    {regime:28s}: {np.mean(gains):.3f}x avg speedup")
+            print(f"    {regime:28s}: {np.mean(gains):.3f}x avg  "
+                  f"(min={min(gains):.3f}x  max={max(gains):.3f}x)")
 
 print(f"\nAll figures → {OUT_DIR}")
