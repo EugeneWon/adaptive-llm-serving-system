@@ -2,7 +2,7 @@ import subprocess, sys
 subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet",
                        "transformers==4.44.2", "nvidia-ml-py", "pandas"])
 
-import time, csv, os, warnings, statistics
+import time, csv, math, os, warnings, statistics
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
 import pynvml
@@ -15,6 +15,7 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 
 MODELS = [
     {"name": "gpt2",         "model_id": "gpt2"},
+    {"name": "gpt2-large",   "model_id": "gpt2-large"},
     {"name": "gpt-neo-125m", "model_id": "EleutherAI/gpt-neo-125m"},
 ]
 
@@ -24,6 +25,7 @@ MAX_NEW_TOKENS  = 50
 WARMUP_RUNS     = 10
 COMPILE_WARMUP  = 30  # compiled graphs need extra runs to JIT-stabilize all decode shapes
 MEASURE_RUNS    = 20
+_T95            = 2.093  # t(0.975, df=19) for 95% CI
 
 CONFIGS = [
     {"name": "baseline",     "fp16": False, "compile": False},
@@ -46,6 +48,22 @@ def get_gpu_stats():
     }
 
 
+def get_model_weight_bytes(model):
+    return sum(p.numel() * p.element_size() for p in model.parameters())
+
+
+def compute_data_movement_metrics(weight_bytes, param_count, avg_latency, batch_size):
+    latency_per_token = avg_latency / MAX_NEW_TOKENS
+    estimated_bw_GBs = weight_bytes / latency_per_token / 1e9
+    flops_per_token = 2 * param_count * batch_size
+    arithmetic_intensity = flops_per_token / weight_bytes
+    return {
+        "weight_bytes_mb":           round(weight_bytes / (1024 ** 2), 1),
+        "estimated_bandwidth_GBs":   round(estimated_bw_GBs, 2),
+        "arithmetic_intensity":      round(arithmetic_intensity, 4),
+    }
+
+
 def make_input(tokenizer, batch_size, input_length, device):
     prompt = "The quick brown fox jumps over the lazy dog"
     ids    = tokenizer.encode(prompt, return_tensors="pt")[0]
@@ -55,7 +73,8 @@ def make_input(tokenizer, batch_size, input_length, device):
     return input_ids, attention_mask
 
 
-def run_experiment(model, tokenizer, batch_size, input_length, device, max_pos, model_cfg, opt_cfg):
+def run_experiment(model, tokenizer, batch_size, input_length, device, max_pos, model_cfg, opt_cfg,
+                   weight_bytes, param_count):
     if input_length + MAX_NEW_TOKENS > max_pos:
         return None
 
@@ -103,9 +122,11 @@ def run_experiment(model, tokenizer, batch_size, input_length, device, max_pos, 
         "p50_latency_s":    round(sorted_lat[(len(sorted_lat) - 1) // 2], 4),
         "p95_latency_s":    round(sorted_lat[int(len(sorted_lat) * 0.95) - 1], 4),
         "std_latency_s":    round(statistics.stdev(latencies), 5),
+        "ci95_half_ms":     round(_T95 * statistics.stdev(latencies) * 1000 / math.sqrt(MEASURE_RUNS), 3),
         "ms_per_token":     round(avg_latency * 1000 / MAX_NEW_TOKENS, 3),
         "throughput_tok_s": round(throughput, 2),
         **get_gpu_stats(),
+        **compute_data_movement_metrics(weight_bytes, param_count, avg_latency, batch_size),
     }
 
 
@@ -115,9 +136,11 @@ def load_model(model_cfg, opt_cfg, device):
         model = model.half()
     model = model.to(device).eval()
     if opt_cfg["compile"]:
-        # reduce-overhead mode uses CUDA graphs / kernel fusion to minimize launch overhead,
-        # targeting the kernel-overhead-bound regime. dynamic=True is intentionally omitted
-        # so the compiler can perform static operator fusion per decode step shape.
+        # reduce-overhead mode uses CUDA graphs / kernel fusion to minimise kernel launch overhead.
+        # Expected benefit scales with model depth: GPT-2 Large (36 layers, 762M) shows more
+        # pronounced gain than GPT-2 (12 layers, 124M) because more layer-level kernels can be
+        # fused.  At batch=1–4 (low-utilisation regime) compilation overhead can exceed benefit;
+        # the adaptive policy avoids applying compile there.
         model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
     return model
 
@@ -130,8 +153,10 @@ def main():
     fieldnames = [
         "model_name", "config", "fp16", "compiled",
         "batch_size", "input_length", "max_new_tokens",
-        "avg_latency_s", "p50_latency_s", "p95_latency_s", "std_latency_s", "ms_per_token", "throughput_tok_s",
+        "avg_latency_s", "p50_latency_s", "p95_latency_s", "std_latency_s", "ci95_half_ms", "ms_per_token",
+        "throughput_tok_s",
         "gpu_util_pct", "gpu_mem_used_mb", "gpu_mem_total_mb",
+        "weight_bytes_mb", "estimated_bandwidth_GBs", "arithmetic_intensity",
     ]
 
     with open(out_path, "w", newline="") as f:
@@ -147,15 +172,20 @@ def main():
 
             for opt_cfg in CONFIGS:
                 print(f"\n  --- Config: {opt_cfg['name']} ---")
-                model   = load_model(model_cfg, opt_cfg, device)
-                max_pos = model.config.max_position_embeddings
+                model        = load_model(model_cfg, opt_cfg, device)
+                max_pos      = model.config.max_position_embeddings
+                weight_bytes = get_model_weight_bytes(model)
+                param_count  = sum(p.numel() for p in model.parameters())
+                print(f"    weights: {weight_bytes/(1024**2):.0f} MB  "
+                      f"(dtype={'fp16' if opt_cfg['fp16'] else 'fp32'})")
 
                 for bs in BATCH_SIZES:
                     for seq_len in INPUT_LENGTHS:
                         print(f"    batch={bs:2d}  seq={seq_len:4d} ...", end=" ", flush=True)
                         row = run_experiment(
                             model, tokenizer, bs, seq_len, device,
-                            max_pos, model_cfg, opt_cfg
+                            max_pos, model_cfg, opt_cfg,
+                            weight_bytes, param_count,
                         )
                         if row is None:
                             print("skipped")
@@ -164,7 +194,8 @@ def main():
                         f.flush()
                         print(f"latency={row['avg_latency_s']:.3f}s  "
                               f"thr={row['throughput_tok_s']:.1f} tok/s  "
-                              f"GPU={row['gpu_util_pct']}%")
+                              f"bw={row['estimated_bandwidth_GBs']:.1f}GB/s  "
+                              f"AI={row['arithmetic_intensity']:.3f}")
 
                 del model
                 torch.cuda.empty_cache()

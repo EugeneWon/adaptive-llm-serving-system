@@ -27,6 +27,7 @@ INPUT_LENGTHS = sorted(adt["input_length"].unique())
 
 MODEL_DISPLAY = {
     "gpt2":         "GPT-2 (124M)",
+    "gpt2-large":   "GPT-2 Large (762M)",
     "gpt-neo-125m": "GPT-Neo (125M)",
 }
 
@@ -94,25 +95,36 @@ fig, axes = plt.subplots(len(MODELS), len(INPUT_LENGTHS),
                          figsize=(5.5 * len(INPUT_LENGTHS), 5 * len(MODELS)),
                          sharey=True, squeeze=False)
 
+has_ci = "speedup_ci95" in adt.columns
+
 for row_i, model_name in enumerate(MODELS):
     madt = adt[adt["model_name"] == model_name]
     for col_i, seq in enumerate(INPUT_LENGTHS):
         ax = axes[row_i][col_i]
         sub_adt = madt[madt["input_length"] == seq].sort_values("batch_size")
         for cfg, color in STATIC_CONFIGS.items():
-            speedups, xs = [], []
+            speedups, xs, errs = [], [], []
             for _, row in sub_adt.iterrows():
                 if cfg == "baseline" and pd.notna(row["speedup"]) and row["speedup"] > 0:
                     # Use in-experiment speedup to eliminate cross-experiment GPU noise
                     speedups.append(float(row["speedup"]))
                     xs.append(row["batch_size"])
+                    if has_ci and pd.notna(row.get("speedup_ci95", float("nan"))):
+                        errs.append(float(row["speedup_ci95"]))
+                    else:
+                        errs.append(0)
                 else:
                     s = get_static(model_name, cfg, row["batch_size"], seq)
                     if s is not None and s > 0:
                         speedups.append(row["throughput_tok_s"] / s)
                         xs.append(row["batch_size"])
-            ax.plot(xs, speedups, marker="o", color=color,
-                    label=f"vs {cfg}", linewidth=1.5)
+                        errs.append(0)
+            if has_ci and any(e > 0 for e in errs) and cfg == "baseline":
+                ax.errorbar(xs, speedups, yerr=errs, fmt="o-", color=color,
+                            capsize=3, linewidth=1.5, label=f"vs {cfg}")
+            else:
+                ax.plot(xs, speedups, marker="o", color=color,
+                        label=f"vs {cfg}", linewidth=1.5)
         ax.axhline(1.0, color="gray", linestyle=":", linewidth=1.2, alpha=0.7)
         ax.set_title(f"{MODEL_DISPLAY.get(model_name, model_name)}\nseq={seq}", fontsize=9)
         ax.set_xlabel("Batch Size")

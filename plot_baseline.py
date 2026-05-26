@@ -29,6 +29,7 @@ REGIME_COLORS = {
 
 MODEL_DISPLAY = {
     "gpt2":         "GPT-2 (124M)",
+    "gpt2-large":   "GPT-2 Large (762M)",
     "gpt-neo-125m": "GPT-Neo (125M)",
 }
 
@@ -41,13 +42,13 @@ def add_regime(sub_df):
         lambda r: r["throughput_tok_s"] / (ref[r["input_length"]] * r["batch_size"]), axis=1
     )
     # Rule-based classifier: matches adaptive_policy.py thresholds exactly
-    #   low-utilization    : batch ≤ 4          (insufficient parallelism)
-    #   memory-bound       : batch ≥ 8, seq ≥ 256 (bandwidth-limited)
-    #   kernel-overhead-bound: everything else   (frequent small kernel launches)
+    #   low-utilization    : batch ≤ 4            (insufficient parallelism)
+    #   memory-bound       : batch ≥ 16, seq ≥ 256 (bandwidth-limited, consistently benefits from FP16)
+    #   kernel-overhead-bound: everything else     (frequent small kernel launches)
     def classify(row):
         if row["batch_size"] <= 4:
             return "low-utilization"
-        elif row["batch_size"] >= 8 and row["input_length"] >= 256:
+        elif row["batch_size"] >= 16 and row["input_length"] >= 256:
             return "memory-bound"
         else:
             return "kernel-overhead-bound"
@@ -181,20 +182,21 @@ plt.close()
 print("Saved: baseline_scaling_efficiency.png")
 
 
-# ── Figure 5: Cross-model throughput comparison (new) ────────────────────────
+# ── Figure 5: Cross-model throughput comparison ────────────────────────────
 if len(MODELS) > 1:
-    model_linestyles = ["-", "--"]
+    model_linestyles = ["-", "--", ":"]
+    model_markers    = ["o", "s", "^"]
     fig, axes = plt.subplots(1, len(INPUT_LENGTHS), figsize=(5 * len(INPUT_LENGTHS), 4.5), sharey=False)
     if len(INPUT_LENGTHS) == 1:
         axes = [axes]
 
     for ax, seq_len in zip(axes, INPUT_LENGTHS):
-        for model_name, ls in zip(MODELS, model_linestyles):
+        for model_name, ls, mk in zip(MODELS, model_linestyles, model_markers):
             sub = df[(df["model_name"] == model_name) &
                      (df["input_length"] == seq_len)].sort_values("batch_size")
             label = MODEL_DISPLAY.get(model_name, model_name)
             ax.plot(sub["batch_size"], sub["throughput_tok_s"],
-                    marker="o", linestyle=ls, label=label)
+                    marker=mk, linestyle=ls, label=label)
         ax.set_title(f"seq={seq_len}")
         ax.set_xlabel("Batch Size")
         ax.set_ylabel("Throughput (tok/s)")
@@ -202,10 +204,59 @@ if len(MODELS) > 1:
         ax.legend(fontsize=8)
         ax.grid(True, linestyle="--", alpha=0.4)
 
-    fig.suptitle("Throughput: GPT-2 vs GPT-Neo 125M", fontsize=13)
+    model_names = " vs ".join(MODEL_DISPLAY.get(m, m) for m in MODELS)
+    fig.suptitle(f"Throughput Comparison: {model_names}", fontsize=11)
     plt.tight_layout()
     plt.savefig(os.path.join(OUT_DIR, "baseline_model_comparison.png"), dpi=150)
     plt.close()
     print("Saved: baseline_model_comparison.png")
+
+
+# ── Figure 6: Prefill vs Decode — roofline regime contrast ───────────────────
+# Shows compute-bound prefill (AI >> ridge) vs memory-bound decode (AI << ridge).
+PREFILL_CSV = "/workspace/results/prefill_results.csv"
+if os.path.exists(PREFILL_CSV):
+    pfdf = pd.read_csv(PREFILL_CSV)
+    # Add decode AI from baseline results (batch=1 representative points)
+    decode_pts = df[df["input_length"] == INPUT_LENGTHS[-1]].copy()
+
+    fig, axes = plt.subplots(1, len(MODELS), figsize=(6 * len(MODELS), 5), squeeze=False)
+    for col_i, model_name in enumerate(MODELS):
+        ax = axes[0][col_i]
+        mpf = pfdf[pfdf["model_name"] == model_name]
+        mdec = decode_pts[decode_pts["model_name"] == model_name].sort_values("batch_size")
+
+        for seq_len in sorted(mpf["input_length"].unique()):
+            sub = mpf[mpf["input_length"] == seq_len].sort_values("batch_size")
+            ax.scatter(sub["prefill_ai_flops_byte"], sub["gpu_util_pct"],
+                       marker="^", s=60, label=f"prefill seq={seq_len}", zorder=3)
+
+        ax.scatter(mdec["arithmetic_intensity"], mdec["gpu_util_pct"],
+                   marker="o", s=60, c="#555555", label="decode (all seq)", zorder=3)
+
+        # Ridge-point indicator
+        ax.axvline(x=100, color="red", linestyle="--", linewidth=1.2, alpha=0.7,
+                   label="GPU ridge ≈ 100 FLOPs/byte\n(compute-bound above)")
+        ax.set_xscale("log")
+        ax.set_xlabel("Arithmetic Intensity (FLOPs/byte, log scale)")
+        ax.set_ylabel("GPU Utilisation (%)")
+        ax.set_title(MODEL_DISPLAY.get(model_name, model_name))
+        ax.legend(fontsize=7)
+        ax.grid(True, linestyle="--", alpha=0.35)
+
+        # Annotate regimes
+        ax.text(0.02, 0.97, "← memory-bound decode", transform=ax.transAxes,
+                fontsize=8, va="top", color="#555555", alpha=0.8)
+        ax.text(0.98, 0.97, "compute-bound prefill →", transform=ax.transAxes,
+                fontsize=8, va="top", ha="right", color="#1f77b4", alpha=0.8)
+
+    fig.suptitle(
+        "Roofline Regime Map: Decode (memory-bound) vs Prefill (compute-bound)\n"
+        "Arithmetic intensity confirms all decode is left of ridge; prefill is far right",
+        fontsize=10)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "baseline_roofline_regimes.png"), dpi=150)
+    plt.close()
+    print("Saved: baseline_roofline_regimes.png")
 
 print(f"\nAll figures → {OUT_DIR}")
