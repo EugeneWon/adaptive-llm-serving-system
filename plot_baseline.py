@@ -6,8 +6,9 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import os
 
-CSV_PATH = "/workspace/results/baseline_results.csv"
-OUT_DIR  = "/workspace/results/figures"
+_BASE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+CSV_PATH = os.path.join(_BASE, "baseline_results.csv")
+OUT_DIR  = os.path.join(_BASE, "figures")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 df = pd.read_csv(CSV_PATH)
@@ -214,7 +215,7 @@ if len(MODELS) > 1:
 
 # ── Figure 6: Prefill vs Decode — roofline regime contrast ───────────────────
 # Shows compute-bound prefill (AI >> ridge) vs memory-bound decode (AI << ridge).
-PREFILL_CSV = "/workspace/results/prefill_results.csv"
+PREFILL_CSV = os.path.join(_BASE, "prefill_results.csv")
 if os.path.exists(PREFILL_CSV):
     pfdf = pd.read_csv(PREFILL_CSV)
     # Add decode AI from baseline results (batch=1 representative points)

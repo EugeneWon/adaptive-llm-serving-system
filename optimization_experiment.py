@@ -1,6 +1,6 @@
 import subprocess, sys
 subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet",
-                       "transformers==4.44.2", "nvidia-ml-py", "pandas"])
+                       "transformers==4.44.2", "nvidia-ml-py", "accelerate", "pandas", "tqdm"])
 
 import time, csv, math, os, warnings, statistics
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -10,7 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 warnings.filterwarnings("ignore")
 
-RESULTS_DIR = "/workspace/results"
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 MODELS = [
@@ -35,7 +35,9 @@ CONFIGS = [
 ]
 
 pynvml.nvmlInit()
-gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+_visible  = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+_gpu_idx  = int(_visible.split(",")[0]) if _visible.strip() else 0
+gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(_gpu_idx)
 
 
 def get_gpu_stats():
@@ -138,16 +140,15 @@ def load_model(model_cfg, opt_cfg, device):
     if opt_cfg["compile"]:
         # reduce-overhead mode uses CUDA graphs / kernel fusion to minimise kernel launch overhead.
         # Expected benefit scales with model depth: GPT-2 Large (36 layers, 762M) shows more
-        # pronounced gain than GPT-2 (12 layers, 124M) because more layer-level kernels can be
-        # fused.  At batch=1–4 (low-utilisation regime) compilation overhead can exceed benefit;
-        # the adaptive policy avoids applying compile there.
+        # pronounced gain than GPT-2 (12 layers, 124M) because more layer-level kernels can be fused.
         model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
     return model
 
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device} | GPU: {torch.cuda.get_device_name(0)}\n")
+    gpu_name = torch.cuda.get_device_name(0) if device.type == "cuda" else "N/A"
+    print(f"Device: {device} | GPU: {gpu_name}\n")
 
     out_path   = os.path.join(RESULTS_DIR, "optimization_results.csv")
     fieldnames = [

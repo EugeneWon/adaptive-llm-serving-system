@@ -9,10 +9,11 @@ cd /workspace
 
 echo "=== [1/2] Installing required Python packages ==="
 pip install \
-  transformers \
+  transformers==4.44.2 \
   accelerate \
   pandas \
   matplotlib \
+  seaborn \
   tqdm \
   pynvml \
   --quiet
@@ -33,5 +34,15 @@ print('torch.compile available:', hasattr(torch, 'compile'))
 echo ""
 echo "=== Setup complete! (Paper 1 - Profiling-Guided Adaptive Optimization) ==="
 echo ""
-echo "--- Run experiment ---"
-echo "python run_experiment.py"
+echo "--- Run experiments in order ---"
+echo "python baseline_inference.py"
+echo "python optimization_experiment.py"
+echo "python adaptive_policy.py"
+echo "python ablation_experiment.py"
+echo "python generalization_check.py"
+echo ""
+echo "--- Plot results ---"
+echo "python plot_baseline.py"
+echo "python plot_optimization.py"
+echo "python plot_adaptive.py"
+echo "python plot_roofline.py"

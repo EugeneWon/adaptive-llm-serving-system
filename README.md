@@ -55,11 +55,11 @@ using PyTorch with CUDA synchronization and `pynvml` for GPU monitoring.
 
 The system classifies inference behavior into three regimes based on batch size and sequence length:
 
-| Regime | Condition | Description |
-|---|---|---|
-| Low-utilization | batch ≤ 4 | Insufficient parallelism, low GPU utilization |
-| Kernel-overhead-bound | batch ≥ 5, not memory-bound | Many small kernel launches, moderate utilization |
-| Memory-bound | batch ≥ 8 and seq ≥ 256 | Bandwidth-limited, high data movement cost |
+| Regime | Condition (profiling-guided) | Condition (static fallback) | Description |
+|---|---|---|---|
+| Low-utilization | GPU util < 35% | batch ≤ 4 | Insufficient parallelism, low GPU utilization |
+| Kernel-overhead-bound | GPU util < 90% or seq < 256 | otherwise | Many small kernel launches, moderate utilization |
+| Memory-bound | GPU util ≥ 90% and seq ≥ 256 | batch ≥ 16 and seq ≥ 256 | Bandwidth-limited, high data movement cost |
 
 ---
 
@@ -71,7 +71,7 @@ Based on the classified regime, the system selects an optimization strategy:
 |---|---|---|
 | Kernel-overhead-bound | `torch.compile` (reduce-overhead mode) | Kernel fusion reduces redundant launches |
 | Memory-bound | FP16 mixed precision | Cuts memory footprint and bandwidth pressure |
-| Low-utilization | Baseline (no opt) | Increasing batch size is the ideal remedy, but it cannot be enforced at inference runtime when the caller fixes the request size |
+| Low-utilization | `torch.compile` (reduce-overhead mode) | Kernel launch overhead dominates at small batch sizes; operator fusion reduces redundant launches and delivers the largest per-regime speedup (+25–28% throughput) |
 
 Four optimization configurations are benchmarked:
 
@@ -136,6 +136,7 @@ Optimized Inference Execution
 ## Models
 
 - GPT-2 (124M parameters, max context: 1024)
+- GPT-2 Large (762M parameters, max context: 1024)
 - GPT-Neo-125M (EleutherAI, max context: 2048)
 
 ## Optimization

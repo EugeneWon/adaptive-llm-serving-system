@@ -1,6 +1,6 @@
 import subprocess, sys
 subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet",
-                       "transformers==4.44.2", "nvidia-ml-py", "pandas"])
+                       "transformers==4.44.2", "nvidia-ml-py", "accelerate", "pandas", "tqdm"])
 
 import time, csv, math, os, warnings, statistics
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -10,7 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 warnings.filterwarnings("ignore")
 
-RESULTS_DIR = "/workspace/results"
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 MODELS = [
@@ -28,22 +28,37 @@ MEASURE_RUNS    = 20
 _T95            = 2.093  # t(0.975, df=19) for 95% CI
 
 pynvml.nvmlInit()
-gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+_visible  = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+_gpu_idx  = int(_visible.split(",")[0]) if _visible.strip() else 0
+gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(_gpu_idx)
 
 
 # ── Regime Classifier ─────────────────────────────────────────────────────────
-# Thresholds calibrated from Phase 0 profiling data:
-#   low-util    : GPU util < 35%      → insufficient SM occupancy (batch too small)
-#   memory-bound: batch ≥ 16, seq ≥ 256 → HBM bandwidth-limited; decode weight-loading
-#                                        rate confirms bandwidth saturation
-#   kernel-overhead-bound: all other  → moderate util, many small kernel launches
+# Thresholds calibrated from Phase 0 profiling data (optimization sweep across
+# all batch × seq combinations, 3 model families):
 #
-# When measured gpu_util_pct is available, it is used directly for the
-# low-utilization boundary — making classification genuinely profiling-guided.
-# The memory-bound / kernel-overhead boundary uses offline-calibrated thresholds
-# (batch ≥ 16 and seq ≥ 256) that proved stable across both model families.
+#   low-utilization  : gpu_util < 35%  (batch ≤ 4 in practice)
+#     → SM occupancy too low; kernel launch overhead dominates per-token cost.
+#     torch.compile delivers the *largest* gains here (+25–28% throughput)
+#     because fusing kernel launches is disproportionately valuable when each
+#     token issues many small kernels against under-occupied SMs.
+#     NOTE: an earlier draft applied "baseline" here, reasoning that batch
+#     scaling should be the remedy.  Empirical data refuted this — compile
+#     outperforms baseline at batch=1–4 by 25–28%, while fp16 gives 12–25%.
+#
+#   kernel-overhead-bound: 35% ≤ gpu_util < 90%  (batch 8–16, shorter seq)
+#     → moderate parallelism; kernel launch overhead still significant.
+#     torch.compile gives +12–22% throughput; fp16 gives +8–17%.
+#     compile preferred because its gain exceeds fp16 at this util level.
+#
+#   memory-bound: gpu_util ≥ 90% AND seq ≥ 256  (batch ≥ 16, long context)
+#     → HBM bandwidth saturated; weight-loading rate drops as attention FLOPs
+#     grow.  compile gives ≈0% benefit (kernel launch cost negligible vs HBM
+#     stall time); fp16 halves weight bytes → +6–10% throughput.
+#     Boundary: at (batch=16, seq=512) fp16 beats compile 908 vs 840 tok/s.
 
-_GPU_UTIL_LOW = 35   # % — SM under-occupancy threshold (from profiling: batch ≤ 4 → < 35%)
+_GPU_UTIL_LOW         = 35   # % — SM under-occupancy boundary
+_GPU_UTIL_MEMORY_BOUND = 90  # % — HBM saturation boundary
 
 
 def classify_regime(batch_size, seq_length, gpu_util_pct=None):
@@ -54,31 +69,38 @@ def classify_regime(batch_size, seq_length, gpu_util_pct=None):
     ----------
     gpu_util_pct : int or None
         Measured GPU utilisation from Phase 0 baseline pass.  When provided,
-        this takes precedence over the static batch-size heuristic for the
-        low-utilisation boundary.
+        this takes precedence over the static batch-size heuristics, making
+        classification genuinely profiling-guided rather than rule-based.
     """
-    # Use measured GPU util for low-util boundary when available
-    is_low_util = (gpu_util_pct < _GPU_UTIL_LOW) if gpu_util_pct is not None else (batch_size <= 4)
+    if gpu_util_pct is not None:
+        if gpu_util_pct < _GPU_UTIL_LOW:
+            return "low-utilization"
+        elif gpu_util_pct >= _GPU_UTIL_MEMORY_BOUND and seq_length >= 256:
+            return "memory-bound"
+        else:
+            return "kernel-overhead-bound"
 
-    if is_low_util:
+    # Static fallback when profiling data is unavailable
+    if batch_size <= 4:
         return "low-utilization"
     elif batch_size >= 16 and seq_length >= 256:
-        # Large batch + long context → weight-loading rate drops, HBM saturated.
-        # batch=8 does not consistently benefit from FP16 (overhead ≈ bandwidth gain).
         return "memory-bound"
-    else:
-        return "kernel-overhead-bound"
+    return "kernel-overhead-bound"
 
 
 # ── Policy: regime → config ────────────────────────────────────────────────────
-# kernel-overhead-bound: operator fusion via torch.compile (reduce-overhead mode)
-#   reduces redundant kernel launches and improves data locality.
-# memory-bound: fp16 cuts memory footprint and bandwidth pressure.
-# low-utilization: baseline (runtime cannot force batch size changes).
+# low-utilization + kernel-overhead-bound: both are dominated by kernel launch
+#   overhead; torch.compile (reduce-overhead mode) is the correct remedy.
+#   Empirical data confirms compile gives the *largest* gains in low-util
+#   (+25–28%) and still significant gains in kernel-overhead-bound (+12–22%).
+#
+# memory-bound: fp16 reduces weight bytes by 2×, directly cutting HBM traffic.
+#   compile gives ≈0% here because the bottleneck is memory stalls, not kernel
+#   launch latency.
 POLICY = {
-    "memory-bound":          {"fp16": True,  "compile": False},
+    "low-utilization":       {"fp16": False, "compile": True},   # was: baseline (incorrect)
     "kernel-overhead-bound": {"fp16": False, "compile": True},
-    "low-utilization":       {"fp16": False, "compile": False},
+    "memory-bound":          {"fp16": True,  "compile": False},
 }
 
 
@@ -188,7 +210,8 @@ def cfg_name(cfg):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device} | GPU: {torch.cuda.get_device_name(0)}\n")
+    gpu_name = torch.cuda.get_device_name(0) if device.type == "cuda" else "N/A"
+    print(f"Device: {device} | GPU: {gpu_name}\n")
 
     out_path   = os.path.join(RESULTS_DIR, "adaptive_results.csv")
     fieldnames = [

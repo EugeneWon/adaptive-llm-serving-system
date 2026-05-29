@@ -28,7 +28,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 warnings.filterwarnings("ignore")
 
-RESULTS_DIR = "/workspace/results"
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 MODELS = [
@@ -46,7 +46,9 @@ MEASURE_RUNS   = 20
 _T95 = 2.093
 
 pynvml.nvmlInit()
-gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+_visible  = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+_gpu_idx  = int(_visible.split(",")[0]) if _visible.strip() else 0
+gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(_gpu_idx)
 
 
 def get_gpu_stats():
@@ -390,6 +392,7 @@ def main():
                               f"bw={row['estimated_bandwidth_GBs']:.1f}GB/s  "
                               f"AI={row['arithmetic_intensity']:.3f}")
                     except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
                         print("OOM — skipped")
 
             del model

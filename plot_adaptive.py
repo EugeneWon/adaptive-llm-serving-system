@@ -7,9 +7,10 @@ import matplotlib.patches as mpatches
 import numpy as np
 import os
 
-OPT_CSV = "/workspace/results/optimization_results.csv"
-ADT_CSV = "/workspace/results/adaptive_results.csv"
-OUT_DIR = "/workspace/results/figures"
+_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+OPT_CSV = os.path.join(_BASE, "optimization_results.csv")
+ADT_CSV = os.path.join(_BASE, "adaptive_results.csv")
+OUT_DIR = os.path.join(_BASE, "figures")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 opt = pd.read_csv(OPT_CSV)
